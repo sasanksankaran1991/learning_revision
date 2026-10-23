@@ -1,0 +1,12 @@
+{
+  "appId": "com.learningrevision.app",
+  "appName": "Learning revision",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "http",
+    "cleartext": true
+  },
+  "android": {
+    "allowMixedContent": true
+  }
+}
