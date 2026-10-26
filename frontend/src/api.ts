@@ -142,6 +142,13 @@ export async function api<T>(path: string, options: RequestInit = {}, retry = tr
 
 export type Me = { id: number; username: string; role: string; timezone: string; must_change_password?: boolean };
 
+export type AppRelease = {
+  version_code: number;
+  version_name: string;
+  apk_url: string | null;
+  notes: string;
+};
+
 export type Group = {
   id: number;
   name: string;
@@ -198,6 +205,7 @@ export type Question = {
   qtype: string;
   is_retest: boolean;
   text: string;
+  photo_code?: string | null;
 };
 
 export type Evaluation = {
@@ -216,16 +224,19 @@ export type SessionState = {
   status?: string;
   topic_id?: number;
   topic_name?: string | null;
+  pool?: string;
   question: Question | null;
   session_score?: number | null;
   answered?: number;
   question_count?: number;
+  practice_result?: Evaluation | null;
 };
 
 export type AnswerResult = {
   evaluation: Evaluation | null;
   next_question: Question | null;
   completed: boolean;
+  counts?: boolean;
   session_score: number | null;
   mastery_level: string;
   next_review_at: string | null;

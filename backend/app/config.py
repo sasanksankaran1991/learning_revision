@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     public_base_url: str = "http://localhost:8000"
     usd_inr_rate: float = 84.0
     cookie_secure: bool = False
+    serve_web: bool = False
     access_token_minutes: int = 15
     refresh_token_days: int = 180
     login_max_failures: int = 10

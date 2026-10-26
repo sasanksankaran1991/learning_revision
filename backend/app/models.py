@@ -272,10 +272,23 @@ class SessionQuestion(Base):
     correction_text: Mapped[Optional[str]] = mapped_column(Text)
     asked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     answered_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    photo_code: Mapped[Optional[str]] = mapped_column(String(8), unique=True)
+    photo_message_id: Mapped[Optional[int]] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
     session: Mapped[Session] = relationship(back_populates="questions")
+
+
+class AnswerPhoto(Base):
+    __tablename__ = "answer_photos"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    question_id: Mapped[int] = mapped_column(ForeignKey("session_questions.id"), nullable=False, index=True)
+    media_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    path: Mapped[str] = mapped_column(String(300), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class AiUsage(Base):

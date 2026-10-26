@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import secrets
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -8,10 +9,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.ai import prompts
-from app.ai.contracts import EvalAndNext, EvalAndSummary, Evaluation, MapResult, QuestionResult, SummaryResult
+from app.ai.contracts import EvalAndSummary, Evaluation, MapResult, QuestionBatch, QuestionResult, SummaryResult
 from app.ai.gateway import BudgetError, NoCredentialError, complete, resolve_credential
 from app.ai.providers import ProviderError
-from app.models import Group, Misconception, Session as StudySession, SessionQuestion, Subtopic, Topic, User, UserSettings
+from app.models import AnswerPhoto, Group, Misconception, Session as StudySession, SessionQuestion, Subtopic, TelegramConfig, Topic, User, UserSettings
 from app.services.planner import PlannedSlot, SubtopicView, plan_session
 from app.services.scoring import mastery_level, next_schedule, session_percent, subtopic_ewma, topic_ewma
 from app.security import as_utc
@@ -19,6 +20,8 @@ from app.services.selector import TopicCandidate, select_topic
 
 _KINDS = {"concept", "math", "application", "pitfall"}
 _IMPORTANCE = {"core", "supporting"}
+CODE_LETTERS = "ABCDEFGHJKMNPQRSTUVWXYZ"
+_SKIP_SCORE = min(0, 1)
 
 
 def completed_today(moment: datetime | None, tz_name: str, now: datetime) -> bool:
@@ -155,12 +158,20 @@ def start_session(db: Session, user: User, group: Group) -> dict:
         )
         return _resume(db, user, active)
     db.refresh(session)
-    _ask(db, user, session, topic, plan[0])
+    _ensure_questions(db, user, session, topic)
     return _session_payload(db, session, topic, outcome="selected")
 
 
-def submit_answer(db: Session, user: User, session: StudySession, idx: int, answer: str) -> dict:
-    if session.status != "active" or session.user_id != user.id:
+def submit_answer(
+    db: Session,
+    user: User,
+    session: StudySession,
+    idx: int,
+    answer: str,
+    image: tuple[str, str] | None = None,
+) -> dict:
+    practice = session.status == "practice"
+    if session.status not in {"active", "practice"} or session.user_id != user.id:
         raise ValueError("That question is not part of the open session")
     topic = db.get(Topic, session.topic_id)
     questions = _questions(db, session.id)
@@ -173,17 +184,18 @@ def submit_answer(db: Session, user: User, session: StudySession, idx: int, answ
     credential = resolve_credential(db, user, topic.group)
     if credential is None:
         raise NoCredentialError("Add an AI key in settings before answering")
-    plan = _plan(session)
-    last = idx >= session.question_count
-    prompt = _eval_prompt(topic, current, answer.strip(), _digest(questions), None if last else plan[idx])
-    schema = EvalAndSummary if last else EvalAndNext
+    last = (not practice) and idx >= session.question_count
+    photos = _image_list(image)
+    stored = answer.strip() or ("Photo of handwritten working." if len(photos) <= 1 else f"{len(photos)} photos of handwritten working.")
+    prompt = _eval_prompt(topic, current, stored, _digest(questions), bool(photos), len(photos) > 1, last)
+    schema = EvalAndSummary if last else Evaluation
     result = complete(
         db,
         user,
         credential=credential,
-        purpose="final_summary" if last else "evaluate_and_next",
+        purpose="final_summary" if last else "evaluate",
         schema=schema,
-        system=prompts.EVAL_SUMMARY_SYSTEM if last else prompts.EVAL_NEXT_SYSTEM,
+        system=prompts.EVAL_SUMMARY_SYSTEM if last else prompts.EVAL_SYSTEM,
         user_prompt=prompt,
         temperature=0.2,
         max_tokens=2500,
@@ -193,23 +205,112 @@ def submit_answer(db: Session, user: User, session: StudySession, idx: int, answ
         subtopic_id=current.subtopic_id,
         session_id=session.id,
         question_id=current.id,
+        image=photos or None,
     )
-    evaluation = _maybe_escalate(db, user, credential, session, topic, current, result.parsed.evaluation, prompt, schema)
-    _apply_evaluation(db, current, evaluation, answer.strip())
-    if evaluation.misconception and current.subtopic_id:
+    evaluation = result.parsed if schema is Evaluation else result.parsed.evaluation
+    evaluation = _maybe_escalate(db, user, credential, session, topic, current, evaluation, prompt, schema, photos or None)
+    _apply_evaluation(db, current, evaluation, stored, official=not practice)
+    if not practice and evaluation.misconception and current.subtopic_id:
         _upsert_misconception(db, user, topic, current, evaluation.misconception)
     db.flush()
-    summary = None
-    if last:
-        summary = _finish(db, session, topic, result.parsed.summary)
-    else:
-        _store_question(db, session, plan[idx], result.parsed.next_question)
+    summary = _finish(db, session, topic, result.parsed.summary) if last else None
+    if practice:
+        session.status = "practiced"
     db.commit()
     if summary is not None:
         from app.services.telegram_summary import notify_session_finished
 
         notify_session_finished(db, user, session, topic, summary["summary"])
     return _answer_payload(db, session, topic, current, summary)
+
+
+def skip_question(db: Session, user: User, session: StudySession, idx: int) -> dict:
+    practice = session.status == "practice"
+    if session.status not in {"active", "practice"} or session.user_id != user.id:
+        raise ValueError("That question is not part of the open session")
+    topic = db.get(Topic, session.topic_id)
+    questions = _questions(db, session.id)
+    current = next((row for row in questions if row.idx == idx), None)
+    if current is None or any(row.idx < idx and row.answer_text is None for row in questions):
+        raise ValueError("Answer the current question first")
+    if current.answer_text is not None:
+        return _answer_payload(db, session, topic, current)
+    last = idx >= session.question_count
+    _apply_evaluation(
+        db,
+        current,
+        Evaluation(score=_SKIP_SCORE, correction="This question was skipped, so it is scored 0.", confidence=1),
+        "Skipped.",
+        official=not practice,
+    )
+    summary = None
+    if practice:
+        session.status = "practiced"
+    elif last:
+        summary = _finish(
+            db,
+            session,
+            topic,
+            SummaryResult(recommendation="A skipped question was scored 0 and will be asked again."),
+        )
+    db.commit()
+    if summary is not None:
+        from app.services.telegram_summary import notify_session_finished
+
+        notify_session_finished(db, user, session, topic, summary["summary"])
+    return _answer_payload(db, session, topic, current, summary)
+
+
+def assign_photo_code(db: Session, user: User, session: StudySession, idx: int) -> SessionQuestion:
+    config = db.query(TelegramConfig).filter(TelegramConfig.user_id == user.id, TelegramConfig.enabled.is_(True)).one_or_none()
+    if config is None or not config.chat_id:
+        raise ValueError("Add your Telegram chat in Settings before sending a photo there.")
+    if session.status not in {"active", "practice"} or session.user_id != user.id:
+        raise ValueError("That question is not part of the open session")
+    questions = _questions(db, session.id)
+    current = next((row for row in questions if row.idx == idx), None)
+    if current is None or any(row.idx < idx and row.answer_text is None for row in questions):
+        raise ValueError("Answer the current question first")
+    if current.answer_text is not None:
+        raise ValueError("That question is already answered")
+    if not current.photo_code:
+        current.photo_code = _new_photo_code(db)
+        db.commit()
+        db.refresh(current)
+    return current
+
+
+def photo_code_status(db: Session, user: User, session: StudySession, idx: int) -> dict:
+    if session.user_id != user.id:
+        raise ValueError("That question is not part of the open session")
+    topic = db.get(Topic, session.topic_id)
+    current = next((row for row in _questions(db, session.id) if row.idx == idx), None)
+    if current is None:
+        raise ValueError("That question is not part of the open session")
+    received = db.query(AnswerPhoto).filter(AnswerPhoto.question_id == current.id).count()
+    if current.answer_text is not None:
+        return {"code": current.photo_code, "status": "graded", "delivered": True, "received": received, "result": _answer_payload(db, session, topic, current)}
+    if current.photo_code:
+        return {"code": current.photo_code, "status": "waiting", "delivered": True, "received": received, "result": None}
+    return {"code": None, "status": "none", "delivered": True, "received": 0, "result": None}
+
+
+def question_for_photo_code(db: Session, user: User, code: str) -> SessionQuestion | None:
+    row = db.query(SessionQuestion).filter(SessionQuestion.photo_code == code.upper()).one_or_none()
+    if row is None:
+        return None
+    session = db.get(StudySession, row.session_id)
+    if session is None or session.user_id != user.id:
+        return None
+    return row
+
+
+def _new_photo_code(db: Session) -> str:
+    for _ in range(12):
+        code = "".join(secrets.choice(CODE_LETTERS) for _ in range(4))
+        if db.query(SessionQuestion).filter(SessionQuestion.photo_code == code).first() is None:
+            return code
+    raise ValueError("Could not create an answer code. Try again.")
 
 
 def abandon_session(db: Session, session: StudySession) -> None:
@@ -225,34 +326,43 @@ def public_session(db: Session, session: StudySession) -> dict:
 
 def _resume(db: Session, user: User, session: StudySession) -> dict:
     topic = db.get(Topic, session.topic_id)
-    if not _questions(db, session.id):
-        plan = _plan(session)
-        if plan:
-            _ask(db, user, session, topic, plan[0])
+    if len(_questions(db, session.id)) < len(_plan(session)):
+        _ensure_questions(db, user, session, topic)
     return _session_payload(db, session, topic, outcome="resume")
 
 
-def _ask(db: Session, user: User, session: StudySession, topic: Topic, slot: PlannedSlot) -> SessionQuestion:
+def _ensure_questions(db: Session, user: User, session: StudySession, topic: Topic) -> None:
+    plan = _plan(session)
+    missing = plan[len(_questions(db, session.id)) :]
+    if not missing:
+        return
     credential = resolve_credential(db, user, topic.group)
     if credential is None:
         raise NoCredentialError("Add an AI key in settings before starting a session")
-    subtopic = db.get(Subtopic, slot.subtopic_id)
     result = complete(
         db,
         user,
         credential=credential,
         purpose="question",
-        schema=QuestionResult,
+        schema=QuestionBatch,
         system=prompts.QUESTION_SYSTEM,
-        user_prompt=_question_prompt(topic, subtopic, slot),
+        user_prompt=_batch_prompt(db, topic, missing),
         temperature=0.7,
-        max_tokens=700,
+        max_tokens=min(4000, 500 * len(missing) + 200),
         group_id=session.group_id,
         topic_id=topic.id,
-        subtopic_id=slot.subtopic_id,
         session_id=session.id,
     )
-    return _store_question(db, session, slot, result.parsed, commit=True)
+    generated = result.parsed.questions
+    if len(generated) < len(missing) or any(not item.question.strip() for item in generated[: len(missing)]):
+        raise ProviderError("The model did not return the session questions")
+    for slot, item in zip(missing, generated):
+        _store_question(db, session, slot, item)
+        db.flush()
+    open_question = next((row for row in _questions(db, session.id) if row.answer_text is None), None)
+    if open_question is not None:
+        session.current_index = open_question.idx
+    db.commit()
 
 
 def _store_question(db, session, slot: PlannedSlot, generated: QuestionResult | None, commit: bool = False) -> SessionQuestion:
@@ -280,7 +390,37 @@ def _store_question(db, session, slot: PlannedSlot, generated: QuestionResult | 
     return row
 
 
-def _apply_evaluation(db: Session, question: SessionQuestion, evaluation: Evaluation, answer: str) -> None:
+def start_practice(db: Session, user: User, topic: Topic, subtopic: Subtopic) -> dict:
+    if topic.user_id != user.id or subtopic.topic_id != topic.id:
+        raise ValueError("That subtopic is not on this topic")
+    slot = PlannedSlot(
+        subtopic_id=subtopic.id,
+        name=subtopic.name,
+        is_retest=False,
+        ucb=None,
+        untested=subtopic.attempts == 0,
+        weakness=None,
+        qtype="derive" if subtopic.kind == "math" else "explain",
+    )
+    session = StudySession(
+        user_id=user.id,
+        group_id=topic.group_id,
+        topic_id=topic.id,
+        status="practice",
+        selection_pool="practice",
+        selection_prob=0,
+        planned_subtopics_json=[_slot_dict(slot)],
+        question_count=1,
+        current_index=0,
+    )
+    db.add(session)
+    db.commit()
+    db.refresh(session)
+    _ensure_questions(db, user, session, topic)
+    return _session_payload(db, session, topic, outcome="practice")
+
+
+def _apply_evaluation(db: Session, question: SessionQuestion, evaluation: Evaluation, answer: str, official: bool = True) -> None:
     score = max(0, min(5, int(evaluation.score)))
     question.answer_text = answer
     question.score = score
@@ -290,20 +430,20 @@ def _apply_evaluation(db: Session, question: SessionQuestion, evaluation: Evalua
     question.misconception_text = evaluation.misconception
     question.correction_text = evaluation.correction
     question.answered_at = datetime.now(timezone.utc)
-    if score <= 2 and question.subtopic_id:
+    if official and score <= 2 and question.subtopic_id:
         subtopic = db.get(Subtopic, question.subtopic_id)
         if subtopic is not None:
             subtopic.retest_next = True
 
 
-def _maybe_escalate(db, user, credential, session, topic, question, evaluation: Evaluation, prompt: str, schema) -> Evaluation:
+def _maybe_escalate(db, user, credential, session, topic, question, evaluation: Evaluation, prompt: str, schema, image=None) -> Evaluation:
     if evaluation.confidence >= 0.6 or not credential.eval_model or credential.eval_model == credential.question_model:
         return evaluation
     result = complete(
         db,
         user,
         credential=credential,
-        purpose="final_summary" if schema is EvalAndSummary else "evaluate_and_next",
+        purpose="final_summary" if schema is EvalAndSummary else "evaluate",
         schema=Evaluation,
         system=prompts.RUBRIC,
         user_prompt=prompt,
@@ -316,6 +456,7 @@ def _maybe_escalate(db, user, credential, session, topic, question, evaluation: 
         subtopic_id=question.subtopic_id,
         session_id=session.id,
         question_id=question.id,
+        image=image,
     )
     return result.parsed
 
@@ -519,6 +660,7 @@ def _question_public(db: Session, row: SessionQuestion | None) -> dict | None:
         "qtype": row.qtype,
         "is_retest": row.is_retest,
         "text": row.question_text,
+        "photo_code": row.photo_code,
     }
 
 
@@ -550,6 +692,9 @@ def _session_payload(db: Session, session: StudySession, topic: Topic, *, outcom
         "session_score": session.session_score,
         "answered": sum(1 for row in questions if row.score is not None),
         "question_count": session.question_count,
+        "practice_result": _evaluation_public(next((row for row in questions if row.score is not None), None))
+        if session.status == "practiced"
+        else None,
     }
 
 
@@ -560,8 +705,9 @@ def _answer_payload(db, session, topic, current, summary: dict | None = None) ->
     nxt = next((row for row in questions if row.idx == current.idx + 1), None)
     body = {
         "evaluation": _evaluation_public(current),
-        "next_question": None if session.status == "completed" else _question_public(db, nxt),
-        "completed": session.status == "completed",
+        "next_question": None if session.status in {"completed", "practiced"} else _question_public(db, nxt),
+        "completed": session.status in {"completed", "practiced"},
+        "counts": session.selection_pool != "practice",
         "session_score": session.session_score,
         "mastery_level": topic.mastery_level,
         "next_review_at": topic.next_review_at,
@@ -578,18 +724,40 @@ def _map_prompt(topic: Topic) -> str:
     )
 
 
-def _question_prompt(topic: Topic, subtopic: Subtopic | None, slot: PlannedSlot) -> str:
-    name = subtopic.name if subtopic is not None else slot.name
-    description = subtopic.description if subtopic is not None else ""
-    return (
-        f"Group instructions:\n{topic.group.guidance_prompt or 'Check real understanding.'}\n\n"
-        f"Topic: {topic.name}\nSubtopic: {name}\nScope: {description or 'core idea'}\n"
-        f"Question type: {slot.qtype}\n"
-        f"This is a retest of a previous mistake: {'yes' if slot.is_retest else 'no'}"
-    )
+def _batch_prompt(db: Session, topic: Topic, slots: list[PlannedSlot]) -> str:
+    lines = [
+        f"Group instructions:\n{topic.group.guidance_prompt or 'Check real understanding.'}",
+        "",
+        f"Topic: {topic.name}",
+        "Write one question for each slot, in order.",
+        "",
+    ]
+    for number, slot in enumerate(slots, start=1):
+        subtopic = db.get(Subtopic, slot.subtopic_id)
+        name = subtopic.name if subtopic is not None else slot.name
+        description = subtopic.description if subtopic is not None and subtopic.description else "core idea"
+        lines.extend(
+            [
+                f"Question {number}",
+                f"Subtopic: {name}",
+                f"Scope: {description}",
+                f"Question type: {slot.qtype}",
+                f"Retest: {'yes' if slot.is_retest else 'no'}",
+                "",
+            ]
+        )
+    return "\n".join(lines)
 
 
-def _eval_prompt(topic, question: SessionQuestion, answer: str, digest: str, nxt: PlannedSlot | None) -> str:
+def _image_list(image) -> list[tuple[str, str]]:
+    if not image:
+        return []
+    if isinstance(image, tuple) and len(image) == 2 and isinstance(image[0], str):
+        return [image]
+    return list(image)
+
+
+def _eval_prompt(topic, question: SessionQuestion, answer: str, digest: str, attached: bool = False, several: bool = False, summarize: bool = False) -> str:
     rubric = question.rubric_json or {}
     lines = [
         f"Topic: {topic.name}",
@@ -599,9 +767,13 @@ def _eval_prompt(topic, question: SessionQuestion, answer: str, digest: str, nxt
         f"Earlier answers this session: {digest or 'none'}",
         f"<learner_answer>\n{answer}\n</learner_answer>",
     ]
-    if nxt is not None:
-        lines.append(f"Next subtopic to ask after the evaluation: {nxt.name}. Type: {nxt.qtype}.")
-    else:
+    if attached:
+        lines.append(
+            "Photos of handwritten working are attached, in the order they were sent. Read that handwriting as part of the answer."
+            if several
+            else "A photo of handwritten working is attached. Read that handwriting as part of the answer."
+        )
+    if summarize:
         lines.append("This is the last question. Include the session summary.")
     return "\n".join(lines)
 

@@ -22,6 +22,7 @@ PURPOSE_CATEGORY = {
     "subtopic_regenerate": "other",
     "weekly_enrich": "recurring_subtopics",
     "question": "revision",
+    "evaluate": "revision",
     "evaluate_and_next": "revision",
     "final_summary": "revision",
     "key_test": "other",

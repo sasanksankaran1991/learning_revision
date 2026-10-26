@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import re
 from datetime import datetime
 
@@ -199,8 +200,56 @@ class SubtopicIn(BaseModel):
         return value
 
 
+_PHOTO_TYPES = {"image/jpeg", "image/png", "image/webp"}
+
+
+def _photo_bytes(media_type: str, data: str) -> bytes:
+    compact = "".join(data.split())
+    if len(compact) > 6_000_000:
+        raise ValueError("That photo is too large. Attach a smaller image.")
+    try:
+        raw = base64.b64decode(compact, validate=True)
+    except Exception as exc:
+        raise ValueError("The photo could not be read") from exc
+    if len(raw) < 32 or len(raw) > 4_000_000:
+        raise ValueError("That photo is too large. Attach a smaller image." if len(raw) > 4_000_000 else "The photo could not be read")
+    if media_type == "image/jpeg" and not raw.startswith(b"\xff\xd8\xff"):
+        raise ValueError("The photo could not be read")
+    if media_type == "image/png" and not raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise ValueError("The photo could not be read")
+    if media_type == "image/webp" and not (raw.startswith(b"RIFF") and raw[8:12] == b"WEBP"):
+        raise ValueError("The photo could not be read")
+    return raw
+
+
+class AnswerImage(BaseModel):
+    media_type: str
+    data: str
+
+    @field_validator("media_type")
+    @classmethod
+    def media_type_ok(cls, value: str) -> str:
+        if value not in _PHOTO_TYPES:
+            raise ValueError("Attach a JPEG, PNG, or WebP photo")
+        return value
+
+    @model_validator(mode="after")
+    def photo_is_readable(self) -> "AnswerImage":
+        _photo_bytes(self.media_type, self.data)
+        self.data = "".join(self.data.split())
+        return self
+
+
 class AnswerIn(BaseModel):
-    answer: str = Field(min_length=1, max_length=8000)
+    answer: str = Field(default="", max_length=8000)
+    image: AnswerImage | None = None
+
+    @model_validator(mode="after")
+    def needs_an_answer(self) -> "AnswerIn":
+        self.answer = self.answer.strip()
+        if not self.answer and self.image is None:
+            raise ValueError("Write an answer or attach a photo")
+        return self
 
 
 def _provider_ok(value: str) -> str:

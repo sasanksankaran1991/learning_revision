@@ -5,8 +5,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import admin, auth, credentials, library, sessions, settings, telegram
-from app.config import get_settings
+from app.api import admin, auth, credentials, library, releases, sessions, settings, telegram
+from app.config import ROOT, get_settings
 from app.db import SessionLocal, init_db
 from app.services.accounts import ensure_bootstrap_admin
 from app.services.telegram_summary import align_summary_time, ensure_telegram_columns, start_scheduler, stop_scheduler
@@ -44,6 +44,14 @@ app.include_router(credentials.router, prefix="/api")
 app.include_router(library.router, prefix="/api")
 app.include_router(sessions.router, prefix="/api")
 app.include_router(telegram.router, prefix="/api")
+app.include_router(releases.router)
+
+if settings_obj.serve_web:
+    from app.web import install_web
+
+    install_web(app, ROOT / "frontend" / "dist")
+    if not settings_obj.cookie_secure:
+        print("COOKIE_SECURE is false. Set COOKIE_SECURE=true in .env before using the public HTTPS site.")
 
 
 @app.get("/api/health")

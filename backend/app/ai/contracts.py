@@ -30,6 +30,10 @@ class QuestionResult(BaseModel):
     rubric: Rubric = Field(default_factory=Rubric)
 
 
+class QuestionBatch(BaseModel):
+    questions: list[QuestionResult] = Field(default_factory=list)
+
+
 class Evaluation(BaseModel):
     score: int = 0
     correct_claims: list[str] = Field(default_factory=list)

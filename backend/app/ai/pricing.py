@@ -2,6 +2,9 @@ from __future__ import annotations
 
 # USD per 1,000,000 tokens: (input, output). Unknown models use the mini rate.
 _RATES = {
+    "gpt-4.1-mini": (0.40, 1.60),
+    "gpt-4.1-nano": (0.10, 0.40),
+    "gpt-4.1": (2.00, 8.00),
     "gpt-4o-mini": (0.15, 0.60),
     "gpt-4o": (2.50, 10.0),
     "claude-3-5-haiku": (0.80, 4.0),

@@ -19,17 +19,19 @@ importance is "core" or "supporting". kind is "concept", "math", "application", 
 Return between 6 and 12 subtopics. Do not include a subtopic that only repeats the topic name."""
 
 QUESTION_SYSTEM = RUBRIC + """
-Write one new question for the requested subtopic and question type.
-Return JSON: {"question", "qtype", "rubric": {"key_points": [], "common_errors": [], "max_score": 5}}
-The question must require an explanation, not a one-word label."""
+Write one new question for every slot you are given, in the same order.
+Return JSON: {"questions": [{"question", "qtype", "rubric": {"key_points": [], "common_errors": [], "max_score": 5}}]}
+Return one question per slot. Each question must require an explanation, not a one-word label.
+Do not repeat a question from an earlier slot."""
 
-EVAL_NEXT_SYSTEM = RUBRIC + """
+EVAL_SYSTEM = RUBRIC + """
 Evaluate the learner answer against the hidden rubric.
-Then write the next question for the subtopic and type you are given. Do not switch subtopics.
-Return JSON: {"evaluation": {"score", "correct_claims", "incomplete_claims", "incorrect_claims", "math_errors", "misconception", "correction", "confidence"}, "next_question": {"question", "qtype", "rubric": {"key_points": [], "common_errors": [], "max_score": 5}}}
+If a photo is attached, the handwriting in that photo is part of the answer. Read it and grade the working together with any typed text.
+Return JSON: {"score", "correct_claims", "incomplete_claims", "incorrect_claims", "math_errors", "misconception", "correction", "confidence"}
 confidence is from 0 to 1. misconception is null when there is none. correction is a short corrected explanation."""
 
 EVAL_SUMMARY_SYSTEM = RUBRIC + """
 Evaluate the learner answer against the hidden rubric, then summarise the whole session from the scores you are given.
+If a photo is attached, the handwriting in that photo is part of the answer. Read it and grade the working together with any typed text.
 Do not invent a percentage. The app computes the score.
 Return JSON: {"evaluation": {"score", "correct_claims", "incomplete_claims", "incorrect_claims", "math_errors", "misconception", "correction", "confidence"}, "summary": {"strengths": [], "weak_subtopics": [], "misconceptions": [], "recommendation"}}"""

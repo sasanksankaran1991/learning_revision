@@ -7,9 +7,11 @@ from app.ai.gateway import NoCredentialError
 from app.ai.providers import ProviderError
 from app.db import get_db
 from app.deps import require_ready_user
-from app.models import Group, Session as StudySession, User
+from app.models import Group, Session as StudySession, TelegramConfig, User
 from app.schemas import AnswerIn
-from app.services.study import abandon_session, public_session, start_session, submit_answer
+from app.security import decrypt_secret
+from app.services.study import abandon_session, assign_photo_code, photo_code_status, public_session, skip_question, start_session, submit_answer
+from app.services.telegram_summary import TelegramError, photo_request_text, send_message
 
 router = APIRouter(tags=["sessions"])
 
@@ -51,8 +53,62 @@ def answer(
 ) -> dict:
     session = _owned(db, user, session_id)
     try:
-        return submit_answer(db, user, session, idx, body.answer)
+        image = None if body.image is None else (body.image.media_type, body.image.data)
+        return submit_answer(db, user, session, idx, body.answer, image)
     except (NoCredentialError, ProviderError, ValueError) as exc:
+        _fail(exc)
+
+
+@router.post("/sessions/{session_id}/questions/{idx}/skip")
+def skip(
+    session_id: int,
+    idx: int,
+    user: User = Depends(require_ready_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    session = _owned(db, user, session_id)
+    try:
+        return skip_question(db, user, session, idx)
+    except (NoCredentialError, ProviderError, ValueError) as exc:
+        _fail(exc)
+
+
+@router.post("/sessions/{session_id}/questions/{idx}/telegram-photo")
+def request_telegram_photo(
+    session_id: int,
+    idx: int,
+    user: User = Depends(require_ready_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    session = _owned(db, user, session_id)
+    try:
+        question = assign_photo_code(db, user, session, idx)
+    except ValueError as exc:
+        _fail(exc)
+    config = db.query(TelegramConfig).filter(TelegramConfig.user_id == user.id, TelegramConfig.enabled.is_(True)).one()
+    delivered = True
+    try:
+        message_id = send_message(decrypt_secret(config.bot_token_enc), config.chat_id, photo_request_text(question, session))
+    except TelegramError:
+        delivered = False
+        message_id = None
+    if message_id:
+        question.photo_message_id = message_id
+        db.commit()
+    return {"code": question.photo_code, "status": "waiting", "delivered": delivered, "result": None}
+
+
+@router.get("/sessions/{session_id}/questions/{idx}/telegram-photo")
+def telegram_photo(
+    session_id: int,
+    idx: int,
+    user: User = Depends(require_ready_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    session = _owned(db, user, session_id)
+    try:
+        return photo_code_status(db, user, session, idx)
+    except ValueError as exc:
         _fail(exc)
 
 

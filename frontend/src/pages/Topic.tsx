@@ -1,6 +1,6 @@
 import { FormEvent, useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { api, Subtopic, TopicDetail } from "../api";
+import { api, SessionState, Subtopic, TopicDetail } from "../api";
 import { submit } from "../form";
 
 export function TopicPage() {
@@ -28,6 +28,16 @@ export function TopicPage() {
       setName("");
       await load();
     }, setError);
+  }
+
+  async function askSubtopic(row: Subtopic) {
+    setError("");
+    try {
+      const started = await api<SessionState>(`/api/topics/${topicId}/subtopics/${row.id}/practice`, { method: "POST" });
+      if (started.session_id) navigate(`/sessions/${started.session_id}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not ask that subtopic");
+    }
   }
 
   async function removeSubtopic(row: Subtopic) {
@@ -81,7 +91,12 @@ export function TopicPage() {
                 <td>{row.attempts}</td>
                 <td>{row.weakness == null ? "—" : row.weakness.toFixed(2)}</td>
                 <td>{row.untested ? "untested" : row.ucb == null ? "—" : row.ucb.toFixed(2)}</td>
-                <td><button className="secondary" type="button" onClick={() => removeSubtopic(row)}>Delete</button></td>
+                <td>
+                  <div className="row">
+                    <button type="button" onClick={() => askSubtopic(row)}>Ask</button>
+                    <button className="secondary" type="button" onClick={() => removeSubtopic(row)}>Delete</button>
+                  </div>
+                </td>
               </tr>
             ))}
           </tbody>

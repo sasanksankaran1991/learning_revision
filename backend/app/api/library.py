@@ -8,6 +8,8 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
+from app.ai.gateway import NoCredentialError
+from app.ai.providers import ProviderError
 from app.db import get_db
 from app.deps import require_ready_user
 from app.models import (
@@ -23,6 +25,7 @@ from app.models import (
 )
 from app.schemas import AnswerIn, GroupIn, GroupOut, GroupPatch, SubtopicIn, TopicImport, TopicIn, TopicPatch
 from app.services.planner import SubtopicView, plan_session, score_subtopics
+from app.services.study import start_practice
 from app.services.selector import TopicCandidate, select_topic
 
 router = APIRouter(tags=["library"])
@@ -289,6 +292,25 @@ def delete_topic(topic_id: int, user: User = Depends(require_ready_user), db: Se
     _delete_topic_rows(db, topic)
     db.commit()
     return {"ok": True}
+
+
+@router.post("/topics/{topic_id}/subtopics/{subtopic_id}/practice")
+def practice_subtopic(
+    topic_id: int,
+    subtopic_id: int,
+    user: User = Depends(require_ready_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    topic = _owned_topic(db, user, topic_id)
+    row = db.get(Subtopic, subtopic_id)
+    if row is None or row.topic_id != topic.id or row.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Subtopic not found")
+    try:
+        return start_practice(db, user, topic, row)
+    except NoCredentialError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @router.post("/topics/{topic_id}/subtopics")

@@ -77,6 +77,7 @@ def complete(
     subtopic_id: int | None = None,
     session_id: int | None = None,
     question_id: int | None = None,
+    image: tuple[str, str] | None = None,
 ) -> LLMResult:
     settings = db.query(UserSettings).filter(UserSettings.user_id == user.id).one()
     if not allow_over_budget and budget_blocked(db, user, settings):
@@ -91,6 +92,7 @@ def complete(
             schema=schema,
             temperature=temperature,
             max_tokens=max_tokens,
+            image=image,
         )
         _record(db, user, settings, credential, chosen, purpose, result, True, None, group_id, topic_id, subtopic_id, session_id, question_id)
         return result

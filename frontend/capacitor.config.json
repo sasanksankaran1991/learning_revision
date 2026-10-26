@@ -3,10 +3,10 @@
   "appName": "Learning revision",
   "webDir": "dist",
   "server": {
-    "androidScheme": "http",
-    "cleartext": true
-  },
-  "android": {
-    "allowMixedContent": true
+    "url": "https://learn.sasanksankaran.in",
+    "androidScheme": "https",
+    "allowNavigation": ["learn.sasanksankaran.in"],
+    "errorPath": "offline.html",
+    "cleartext": false
   }
 }

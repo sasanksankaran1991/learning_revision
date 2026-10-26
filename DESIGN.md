@@ -457,8 +457,9 @@ When an answer scores **≤ 2**:
 
 The next time this topic is selected (another day, §5.3), the planner reserves a slot for each flagged subtopic, up to `max_retests_per_session`, before UCB fills the rest. The flag is cleared when that retest question is **asked**. If the retest also scores ≤ 2, the flag is set again for the session after that.
 
-The planner decides *what* to ask; the AI decides *how* to phrase it. Question wording always includes the group's
-`guidance_prompt`, so the same stored subtopics are asked in the style the user set for that group.
+The planner decides *what* to ask. When the session starts, one AI call writes a fresh question for every planned slot and those rows are stored. Skip, continue, and a refresh read the next stored question. A later session asks for a new set of wording. The group's `guidance_prompt` is included in that call.
+
+Each subtopic also has an **Ask** button on the topic page. That asks one fresh question for that subtopic alone. The grade is shown and then discarded from the record: it does not change the session score, the subtopic's running score, the retest flag, or the topic's next review.
 
 ### 6.5 Add a subtopic after an evaluation
 
@@ -585,10 +586,10 @@ retry on invalid JSON, then fail gracefully.
 
 | Step | Calls |
 |---|---|
-| Q1 generation | 1 |
-| Answer k evaluation **+** Q k+1 generation (combined) | N − 1 |
-| Answer N evaluation **+** final summary (combined) | 1 |
-| **Total per session** | **N + 1** (6 for N=5) |
+| All N questions for this session | 1, at session start |
+| Each submitted answer | 1 grade. The last grade also writes the session summary |
+| Skip | 0 |
+| **Total when every question is answered** | **N + 1** (6 for N=5) |
 
 Plus 1 call per topic when it is first added, for the initial subtopic map.
 Plus at most **1 call per user per week** for enrichment, and only for the single topic §6.6 selects. A week with no weak topic costs nothing.
@@ -814,28 +815,26 @@ Math answers: textarea with live KaTeX preview (`$...$`).
 
 ---
 
-## 14. Deployment (personal machine + Cloudflare)
+## 14. Deployment (Windows PC + the existing Cloudflare tunnel)
+
+The Mac is where the app is built. Production is the Windows desktop that already stays on and already publishes another app through Cloudflare Tunnel.
+
+`python run.py serve` (or `run.bat serve`) starts one process on `127.0.0.1:8000`. That process serves the built website, the API under `/api`, and the Telegram poller. The database is `data/app.db` on that PC.
+
+The tunnel config gains one hostname. The planner stays on port 8080.
 
 ```yaml
-# docker-compose.yml (sketch)
-services:
-  api:
-    build: ./backend
-    env_file: .env
-    volumes: ["./data:/app/data"]
-    expose: ["8000"]
-  web:
-    build: ./frontend          # static build served by Caddy, proxies /api → api:8000
-    expose: ["80"]
-  cloudflared:
-    image: cloudflare/cloudflared:latest
-    command: tunnel run
-    environment: ["TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}"]
+ingress:
+  - hostname: planner.sasanksankaran.in
+    service: http://localhost:8080
+  - hostname: learn.sasanksankaran.in
+    service: http://localhost:8000
+  - service: http_status:404
 ```
 
-- Single public hostname, e.g. `learn.yourdomain.com` → `web`; API under `/api` (same origin → simpler CORS & cookies).
-- APK points to the same hostname.
-- Backups: nightly `sqlite3 .backup` to `backups/` (git-ignored), keep 14 days.
+- The website and the API share `https://learn.sasanksankaran.in`, so the browser cookie stays on that host.
+- The APK points at the same hostname.
+- `python run.py backup` copies the database into `data/backups` and keeps 14 copies. The steps are in [PRODUCTION.md](PRODUCTION.md).
 
 ---
 
@@ -849,7 +848,7 @@ services:
 | M4 | Session engine: Q/A/evaluate/probe/summary, resume, idempotency | end-to-end session via API |
 | M5 | React web app: all screens | full flow in browser |
 | M6 | Telegram daily summary, weekly subtopic enrichment, usage dashboard | summary received on schedule; weak topic gains new subtopics after a week of answers |
-| M7 | Docker Compose + Cloudflare Tunnel + backups | reachable via public hostname |
+| M7 | One process on the Windows PC, hostname added to the existing Cloudflare tunnel, database backups | `https://learn.sasanksankaran.in` opens the site and the API |
 | M8 | Capacitor Android build + signed APK | APK installs & syncs with web |
 
 ---
@@ -869,6 +868,7 @@ services:
 | Once per day | A topic with a completed session today is not selected again until the next local midnight. If every topic in the group is done today, no new session starts |
 | Retest timing | A score ≤ 2 flags that subtopic. It is asked in the **next** session on that topic, not as the next question. Up to 2 retest slots, then UCB fills the rest |
 | Subtopic choice | UCB1: weakness `Q` plus `c √(ln N / n)`, default `c = √2`. Untested subtopics rank first (core before supporting). The topic page shows each subtopic's UCB |
+| Where it runs | Build on the Mac. Production is the always-on Windows PC: one process on port 8000, published by adding `learn.sasanksankaran.in` to the Cloudflare tunnel that PC already runs |
 
 ## 17. Open questions
 

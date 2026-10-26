@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link, NavLink, Navigate, Outlet, Route, Routes, useNavigate } from "react-router-dom";
-import { api, endSession, getToken, isNative, Me, refreshSession, setToken } from "./api";
+import { api, AppRelease, endSession, getToken, isNative, Me, refreshSession, setToken } from "./api";
 import { AdminPage } from "./pages/Admin";
 import { GroupPage } from "./pages/Group";
 import { HomePage } from "./pages/Home";
@@ -13,6 +13,7 @@ import { UsagePage } from "./pages/Usage";
 export function App() {
   const [me, setMe] = useState<Me | null>(null);
   const [ready, setReady] = useState(false);
+  const [update, setUpdate] = useState<AppRelease | null>(null);
 
   useEffect(() => {
     refreshSession()
@@ -23,6 +24,28 @@ export function App() {
       .catch(() => setToken(null))
       .finally(() => setReady(true));
   }, []);
+
+  useEffect(() => {
+    if (!isNative()) return;
+    let cancelled = false;
+    (async () => {
+      const [{ App: NativeApp }, release] = await Promise.all([
+        import("@capacitor/app"),
+        api<AppRelease>("/api/app/release"),
+      ]);
+      const info = await NativeApp.getInfo();
+      if (cancelled || !release.apk_url || release.version_code <= Number(info.build)) return;
+      setUpdate(release);
+    })().catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  function installUpdate() {
+    if (!update?.apk_url) return;
+    window.location.assign(update.apk_url);
+  }
 
   useEffect(() => {
     if (!isNative()) return;
@@ -38,10 +61,19 @@ export function App() {
     return () => remove();
   }, []);
 
-  if (!ready) return <p className="page">Checking your session…</p>;
+  if (!ready) {
+    return (
+      <>
+        <UpdateBar update={update} onInstall={installUpdate} onLater={() => setUpdate(null)} />
+        <p className="page">Checking your session…</p>
+      </>
+    );
+  }
 
   return (
-    <Routes>
+    <>
+      <UpdateBar update={update} onInstall={installUpdate} onLater={() => setUpdate(null)} />
+      <Routes>
       <Route path="/login" element={me ? <Navigate to={me.must_change_password ? "/password" : "/"} replace /> : <LoginPage onLogin={setMe} />} />
       <Route path="/password" element={me ? <PasswordPage onDone={() => setMe(null)} /> : <Navigate to="/login" replace />} />
       <Route element={me && !me.must_change_password ? <Shell me={me} onLogout={() => setMe(null)} /> : <Navigate to={me ? "/password" : "/login"} replace />}>
@@ -54,6 +86,23 @@ export function App() {
         <Route path="/admin" element={me?.role === "admin" ? <AdminPage /> : <Navigate to="/" replace />} />
       </Route>
     </Routes>
+    </>
+  );
+}
+
+function UpdateBar({ update, onInstall, onLater }: { update: AppRelease | null; onInstall: () => void; onLater: () => void }) {
+  if (!update) return null;
+  return (
+    <div className="update-bar">
+      <p>
+        A new phone version is ready{update.version_name ? ` (${update.version_name})` : ""}.
+        {update.notes ? ` ${update.notes}` : ""} It replaces the app you have. You do not uninstall it first.
+      </p>
+      <div className="row">
+        <button type="button" onClick={onInstall}>Update</button>
+        <button type="button" className="secondary" onClick={onLater}>Not now</button>
+      </div>
+    </div>
   );
 }
 

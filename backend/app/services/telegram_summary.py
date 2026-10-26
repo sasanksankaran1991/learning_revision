@@ -1,21 +1,32 @@
 from __future__ import annotations
 
+import base64
 import html
+import re
+import secrets
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import httpx
 from sqlalchemy.orm import Session
 
-from app.models import AiUsage, Group, Misconception, Session as StudySession, SessionQuestion, Subtopic, TelegramConfig, Topic, User, UserSettings
+from app.config import ROOT
+from app.models import AiUsage, AnswerPhoto, Group, Misconception, Session as StudySession, SessionQuestion, Subtopic, TelegramConfig, Topic, User, UserSettings
 from app.security import as_utc, decrypt_secret
 from app.services.accounts import audit
+from app.services.study import CODE_LETTERS
 
 _sender = None
 _lookup = None
 _updates = None
+_files = None
 _scheduler = None
+_CODE_RE = re.compile(rf"[{CODE_LETTERS}]{{4}}")
+_PHOTO_WAIT = timedelta(seconds=45)
+_MAX_PHOTOS = 4
+_IMAGE_TYPES = {"image/jpeg": "image/jpeg", "image/jpg": "image/jpeg", "image/png": "image/png", "image/webp": "image/webp"}
 
 
 class TelegramError(Exception):
@@ -28,10 +39,16 @@ def set_sender(sender) -> None:
 
 
 def reset_sender() -> None:
-    global _sender, _lookup, _updates
+    global _sender, _lookup, _updates, _files
     _sender = None
     _lookup = None
     _updates = None
+    _files = None
+
+
+def set_files(fetcher) -> None:
+    global _files
+    _files = fetcher
 
 
 def set_updates(fetcher) -> None:
@@ -44,10 +61,10 @@ def set_lookup(lookup) -> None:
     _lookup = lookup
 
 
-def send_message(token: str, chat_id: str, text: str) -> None:
+def send_message(token: str, chat_id: str, text: str) -> int | None:
     if _sender is not None:
-        _sender(token, chat_id, text)
-        return
+        result = _sender(token, chat_id, text)
+        return result if isinstance(result, int) else None
     try:
         response = httpx.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
@@ -65,6 +82,11 @@ def send_message(token: str, chat_id: str, text: str) -> None:
         if isinstance(description, str) and token not in description:
             detail = description
         raise TelegramError(detail)
+    try:
+        message_id = int((response.json().get("result") or {}).get("message_id") or 0)
+    except (TypeError, ValueError):
+        return None
+    return message_id or None
 
 
 def lookup_chats(token: str) -> list[dict]:
@@ -118,6 +140,43 @@ def fetch_updates(token: str, offset: int | None) -> list[dict]:
     if response.status_code >= 400:
         raise TelegramError("Telegram rejected the token")
     return response.json().get("result") or []
+
+
+def fetch_file(token: str, file_id: str) -> tuple[str, bytes]:
+    if _files is not None:
+        return _files(token, file_id)
+    try:
+        meta = httpx.get(f"https://api.telegram.org/bot{token}/getFile", params={"file_id": file_id}, timeout=20)
+    except httpx.HTTPError as exc:
+        raise TelegramError("Telegram could not be reached") from exc
+    if meta.status_code >= 400:
+        raise TelegramError("Telegram could not read that photo")
+    path = str((meta.json().get("result") or {}).get("file_path") or "")
+    if not path or path.startswith("/") or ".." in path:
+        raise TelegramError("Telegram could not read that photo")
+    try:
+        blob = httpx.get(f"https://api.telegram.org/file/bot{token}/{path}", timeout=30)
+    except httpx.HTTPError as exc:
+        raise TelegramError("Telegram could not be reached") from exc
+    if blob.status_code >= 400:
+        raise TelegramError("Telegram could not read that photo")
+    return _mime_from_path(path), blob.content
+
+
+def photo_request_text(question: SessionQuestion, session: StudySession) -> str:
+    snippet = " ".join((question.question_text or "").split())
+    if len(snippet) > 240:
+        snippet = snippet[:237] + "..."
+    return "\n".join(
+        [
+            f"Answer code {_esc(question.photo_code or '')}",
+            f"Question {question.idx} of {session.question_count}",
+            _esc(snippet),
+            "",
+            "Send one or more photos with this code in the caption.",
+            "Send DONE to grade them now. Otherwise they are graded together about a minute after the last photo.",
+        ]
+    )
 
 
 def build_summary(db: Session, user: User, settings: UserSettings, moment: datetime, day=None) -> str | None:
@@ -351,20 +410,32 @@ def poll_commands(db: Session, moment: datetime | None = None) -> int:
             next_offset = max(next_offset, update_id + 1)
             message = update.get("message") or {}
             chat_id = str((message.get("chat") or {}).get("id", ""))
-            command = _command(message.get("text") or "")
             match = next((row for row in rows if row.chat_id == chat_id), None)
-            if match is None or command is None:
+            if match is None:
                 continue
             user = db.get(User, match.user_id)
             settings = db.query(UserSettings).filter(UserSettings.user_id == match.user_id).one_or_none()
             if user is None or not user.is_active or settings is None:
+                continue
+            done_code = _done_code(message.get("text") or "")
+            if done_code is not None and _message_image(message) is None:
+                if _grade_done(db, token, chat_id, user, done_code):
+                    handled += 1
+                continue
+            image = _message_image(message)
+            if image is not None:
+                if _save_telegram_photo(db, token, chat_id, user, message, image, moment):
+                    handled += 1
+                continue
+            command = _command(message.get("text") or "")
+            if command is None:
                 continue
             if command in {"usage", "useage"}:
                 text = build_usage_message(db, user, settings, moment)
             elif command == "status":
                 text = build_status_message(db, user, moment)
             else:
-                text = "Send /usage for today's token use.\nSend /status for each group and topic."
+                text = "Send /usage for today's token use.\nSend /status for each group and topic.\nSend a photo with its 4-letter answer code, then DONE to grade every photo with that code."
             try:
                 send_message(token, chat_id, text)
                 handled += 1
@@ -372,6 +443,9 @@ def poll_commands(db: Session, moment: datetime | None = None) -> int:
                 audit(db, "telegram_failed", user_id=user.id, meta={"error": exc.__class__.__name__})
         for row in rows:
             row.update_offset = next_offset
+            owner = db.get(User, row.user_id)
+            if owner is not None and owner.is_active:
+                handled += _grade_due_photos(db, token, row.chat_id, owner, moment)
         db.commit()
     return handled
 
@@ -460,6 +534,209 @@ def _bucket(item: dict) -> str:
     return f"{_count(item['tokens'])} tok · {_money(item['usd'], item['inr'])}"
 
 
+def _mime_from_path(path: str) -> str:
+    lower = path.lower()
+    if lower.endswith(".png"):
+        return "image/png"
+    if lower.endswith(".webp"):
+        return "image/webp"
+    return "image/jpeg"
+
+
+def _message_image(message: dict) -> dict | None:
+    photos = message.get("photo") or []
+    if photos:
+        best = photos[-1]
+        return {"file_id": str(best.get("file_id") or ""), "media_type": "image/jpeg", "file_size": int(best.get("file_size") or 0)}
+    document = message.get("document") or {}
+    media = _IMAGE_TYPES.get(str(document.get("mime_type") or "").lower())
+    if media and document.get("file_id"):
+        return {"file_id": str(document["file_id"]), "media_type": media, "file_size": int(document.get("file_size") or 0)}
+    return None
+
+
+def _codes_in(message: dict) -> list[str]:
+    caption = str(message.get("caption") or message.get("text") or "").upper()
+    return _CODE_RE.findall(caption)
+
+
+def _done_code(text: str) -> str | None:
+    parts = text.strip().split()
+    if not parts:
+        return None
+    head = parts[0].split("@", 1)[0].lower()
+    if head not in {"done", "/done"}:
+        return None
+    if len(parts) >= 2 and _CODE_RE.fullmatch(parts[1].upper()):
+        return parts[1].upper()
+    return ""
+
+
+def _save_telegram_photo(db: Session, token: str, chat_id: str, user: User, message: dict, image: dict, moment: datetime) -> bool:
+    from app.schemas import _photo_bytes
+
+    question = _question_for_message(db, user, message)
+    if question is None:
+        send_message(token, chat_id, "That photo has no answer code. On the question, choose Send on Telegram, then send the photo with that code in the caption.")
+        return True
+    code = question.photo_code or ""
+    if question.answer_text is not None:
+        send_message(token, chat_id, f"Answer code {_esc(code)} is already graded.")
+        return True
+    held = db.query(AnswerPhoto).filter(AnswerPhoto.question_id == question.id).count()
+    if held >= _MAX_PHOTOS:
+        send_message(token, chat_id, f"Answer code {_esc(code)} already has {_MAX_PHOTOS} photos. Send DONE to grade them.")
+        return True
+    if not image.get("file_id") or int(image.get("file_size") or 0) > 4_000_000:
+        send_message(token, chat_id, f"That photo is too large for answer code {_esc(code)}. Send a smaller image with the code in the caption.")
+        return True
+    session = db.get(StudySession, question.session_id)
+    if session is None or session.status not in {"active", "practice"}:
+        send_message(token, chat_id, f"Answer code {_esc(code)} is not part of an open session.")
+        return True
+    try:
+        media_type, raw = fetch_file(token, image["file_id"])
+        if image["media_type"] != "image/jpeg":
+            media_type = image["media_type"]
+        _photo_bytes(media_type, base64.b64encode(raw).decode())
+        folder = ROOT / "data" / "answer_photos" / str(question.id)
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{secrets.token_hex(8)}{_suffix(media_type)}"
+        path.write_bytes(raw)
+        db.add(AnswerPhoto(user_id=user.id, question_id=question.id, media_type=media_type, path=str(path), created_at=moment))
+        db.commit()
+    except Exception as exc:
+        audit(db, "telegram_failed", user_id=user.id, meta={"error": exc.__class__.__name__})
+        db.commit()
+        send_message(token, chat_id, f"The photo for answer code {_esc(code)} could not be saved. Send it again with the same code.")
+        return True
+    send_message(token, chat_id, f"Saved {held + 1} photo{'s' if held else ''} for {_esc(code)}. Send more with this code, or send DONE to grade now.")
+    return True
+
+
+def _grade_done(db: Session, token: str, chat_id: str, user: User, code: str) -> bool:
+    from app.services.study import question_for_photo_code
+
+    if code:
+        question = question_for_photo_code(db, user, code)
+        if question is None:
+            send_message(token, chat_id, f"Answer code {_esc(code)} is not waiting for a photo.")
+            return True
+    else:
+        waiting = _waiting_photo_questions(db, user)
+        if len(waiting) == 1:
+            question = waiting[0]
+        elif not waiting:
+            send_message(token, chat_id, "Send a photo with its answer code before DONE.")
+            return True
+        else:
+            send_message(token, chat_id, "Send DONE and the 4-letter answer code.")
+            return True
+    if question.answer_text is not None:
+        send_message(token, chat_id, f"Answer code {_esc(question.photo_code or '')} is already graded.")
+        return True
+    if db.query(AnswerPhoto).filter(AnswerPhoto.question_id == question.id).count() == 0:
+        send_message(token, chat_id, f"No photo has arrived for answer code {_esc(question.photo_code or '')}.")
+        return True
+    _grade_saved(db, token, chat_id, user, question)
+    return True
+
+
+def _grade_due_photos(db: Session, token: str, chat_id: str, user: User, moment: datetime) -> int:
+    graded = 0
+    for question in _waiting_photo_questions(db, user):
+        rows = db.query(AnswerPhoto).filter(AnswerPhoto.question_id == question.id).all()
+        if not rows:
+            continue
+        newest = max(as_utc(row.created_at) for row in rows)
+        if as_utc(moment) - newest < _PHOTO_WAIT:
+            continue
+        _grade_saved(db, token, chat_id, user, question)
+        graded += 1
+    return graded
+
+
+def _waiting_photo_questions(db: Session, user: User) -> list[SessionQuestion]:
+    rows = (
+        db.query(SessionQuestion)
+        .join(AnswerPhoto, AnswerPhoto.question_id == SessionQuestion.id)
+        .filter(AnswerPhoto.user_id == user.id, SessionQuestion.answer_text.is_(None))
+        .all()
+    )
+    found: dict[int, SessionQuestion] = {}
+    for row in rows:
+        session = db.get(StudySession, row.session_id)
+        if session is not None and session.user_id == user.id and session.status in {"active", "practice"}:
+            found[row.id] = row
+    return list(found.values())
+
+
+def _grade_saved(db: Session, token: str, chat_id: str, user: User, question: SessionQuestion) -> None:
+    from app.services.study import submit_answer
+
+    code = question.photo_code or ""
+    session = db.get(StudySession, question.session_id)
+    rows = db.query(AnswerPhoto).filter(AnswerPhoto.question_id == question.id).order_by(AnswerPhoto.id).all()
+    if session is None or not rows:
+        return
+    images = []
+    for row in rows[:_MAX_PHOTOS]:
+        raw = Path(row.path).read_bytes()
+        images.append((row.media_type, base64.b64encode(raw).decode()))
+    try:
+        result = submit_answer(db, user, session, question.idx, "", images)
+    except Exception as exc:
+        audit(db, "telegram_failed", user_id=user.id, meta={"error": exc.__class__.__name__})
+        db.commit()
+        send_message(token, chat_id, f"The photos for answer code {_esc(code)} could not be graded. Send DONE to try again.")
+        return
+    _delete_photos(db, rows)
+    score = (result.get("evaluation") or {}).get("score")
+    count = len(images)
+    send_message(token, chat_id, f"Answer code {_esc(code)} scored {score}/5 from {count} photo{'s' if count != 1 else ''}.")
+
+
+def _delete_photos(db: Session, rows: list[AnswerPhoto]) -> None:
+    folders: set[Path] = set()
+    for row in rows:
+        path = Path(row.path)
+        folders.add(path.parent)
+        path.unlink(missing_ok=True)
+        db.delete(row)
+    db.commit()
+    for folder in folders:
+        if folder.is_dir() and not any(folder.iterdir()):
+            folder.rmdir()
+
+
+def _suffix(media_type: str) -> str:
+    if media_type == "image/png":
+        return ".png"
+    if media_type == "image/webp":
+        return ".webp"
+    return ".jpg"
+
+
+def _question_for_message(db: Session, user: User, message: dict) -> SessionQuestion | None:
+    from app.services.study import question_for_photo_code
+
+    for code in _codes_in(message):
+        row = question_for_photo_code(db, user, code)
+        if row is not None:
+            return row
+    reply = message.get("reply_to_message") or {}
+    reply_id = reply.get("message_id")
+    if reply_id is None:
+        return None
+    row = db.query(SessionQuestion).filter(SessionQuestion.photo_message_id == int(reply_id)).one_or_none()
+    if row is None:
+        return None
+    session = db.get(StudySession, row.session_id)
+    if session is None or session.user_id != user.id:
+        return None
+    return row
+
+
 def ensure_telegram_columns(db: Session) -> None:
     from sqlalchemy import text
 
@@ -469,6 +746,16 @@ def ensure_telegram_columns(db: Session) -> None:
     columns = {row[1] for row in db.execute(text("PRAGMA table_info(telegram_configs)"))}
     if columns and "update_offset" not in columns:
         db.execute(text("ALTER TABLE telegram_configs ADD COLUMN update_offset INTEGER"))
+        db.commit()
+    question_columns = {row[1] for row in db.execute(text("PRAGMA table_info(session_questions)"))}
+    if question_columns and "photo_code" not in question_columns:
+        db.execute(text("ALTER TABLE session_questions ADD COLUMN photo_code VARCHAR(8)"))
+        db.commit()
+    if question_columns and "photo_message_id" not in question_columns:
+        db.execute(text("ALTER TABLE session_questions ADD COLUMN photo_message_id INTEGER"))
+        db.commit()
+    if question_columns:
+        db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_session_question_photo_code ON session_questions(photo_code)"))
         db.commit()
 
 

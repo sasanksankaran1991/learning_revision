@@ -2,7 +2,7 @@
 
 Adaptive revision for topics you have already studied. You keep groups of topics. The app chooses what to revise, asks questions, and tracks weak subtopics. This repository contains the design, the API, and the web app.
 
-The product design is in [DESIGN.md](DESIGN.md). How the public hostname is wired is in [PRODUCTION.md](PRODUCTION.md).
+The product design is in [DESIGN.md](DESIGN.md). How to run it on the Windows PC is in [PRODUCTION.md](PRODUCTION.md).
 
 ## What works now
 
@@ -51,9 +51,20 @@ npm run dev
 
 Open http://localhost:5173. The dev server proxies `/api` to the backend, so the login cookie stays on the same origin.
 
+## Windows server
+
+The always-on Windows PC runs the website and the API as one process. From the project folder, after the one-time setup in [PRODUCTION.md](PRODUCTION.md):
+
+```cmd
+run.bat build
+run.bat serve
+```
+
+That listens on http://127.0.0.1:8000. The Cloudflare tunnel you already use for the planner gets one more hostname, `learn.sasanksankaran.in`, aimed at that port.
+
 ## Android APK
 
-The APK is the same screens as the web app. Both ask `https://learn.sasanksankaran.in` for groups, sessions, and scores. How that hostname is wired is in [PRODUCTION.md](PRODUCTION.md).
+The phone app opens `https://learn.sasanksankaran.in`, so a website update shows up the next time you open it. A new APK is only for a change to the Android package. When one is published, the app asks you to update and the new package replaces the old one. The steps are in [PRODUCTION.md](PRODUCTION.md).
 
 The installable file is `learning-revision.apk` in this folder. Copy it to the phone and open it. Android will ask you to allow an install from that source. The login screen shows the server address. If an older address was saved on the phone, replace it with `https://learn.sasanksankaran.in`.
 

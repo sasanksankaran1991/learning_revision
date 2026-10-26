@@ -41,9 +41,9 @@ def _usage_openai(payload: dict) -> tuple[int, int, int]:
     return int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0), int(details.get("cached_tokens") or 0)
 
 
-def _post(url: str, *, headers: dict, body: dict, params: dict | None = None) -> dict:
+def _post(url: str, *, headers: dict, body: dict, params: dict | None = None, timeout: float = 45) -> dict:
     try:
-        response = httpx.post(url, headers=headers, json=body, params=params, timeout=45)
+        response = httpx.post(url, headers=headers, json=body, params=params, timeout=timeout)
     except httpx.HTTPError as exc:
         raise ProviderError("The model provider could not be reached") from exc
     if response.status_code >= 400:
@@ -51,7 +51,34 @@ def _post(url: str, *, headers: dict, body: dict, params: dict | None = None) ->
     return response.json()
 
 
-def _openai_text(base_url: str, api_key: str, model: str, system: str, user_prompt: str, temperature: float, max_tokens: int) -> tuple[str, int, int, int]:
+def image_list(image) -> list[tuple[str, str]]:
+    if not image:
+        return []
+    if isinstance(image, tuple) and len(image) == 2 and isinstance(image[0], str):
+        return [image]
+    return list(image)
+
+
+def openai_user_content(user_prompt: str, image):
+    images = image_list(image)
+    if not images:
+        return user_prompt
+    content = [{"type": "text", "text": user_prompt}]
+    for media_type, data in images:
+        content.append({"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{data}"}})
+    return content
+
+
+def _openai_text(
+    base_url: str,
+    api_key: str,
+    model: str,
+    system: str,
+    user_prompt: str,
+    temperature: float,
+    max_tokens: int,
+    image: tuple[str, str] | None = None,
+) -> tuple[str, int, int, int]:
     payload = _post(
         base_url.rstrip("/") + "/chat/completions",
         headers={"Authorization": f"Bearer {api_key}"},
@@ -62,16 +89,33 @@ def _openai_text(base_url: str, api_key: str, model: str, system: str, user_prom
             "response_format": {"type": "json_object"},
             "messages": [
                 {"role": "system", "content": system},
-                {"role": "user", "content": user_prompt},
+                {"role": "user", "content": openai_user_content(user_prompt, image)},
             ],
         },
+        timeout=90 if image_list(image) else 45,
     )
     prompt, completion, cached = _usage_openai(payload)
     text = payload["choices"][0]["message"].get("content") or ""
     return text, prompt, completion, cached
 
 
-def _anthropic_text(api_key: str, model: str, system: str, user_prompt: str, temperature: float, max_tokens: int) -> tuple[str, int, int, int]:
+def _anthropic_text(
+    api_key: str,
+    model: str,
+    system: str,
+    user_prompt: str,
+    temperature: float,
+    max_tokens: int,
+    image: tuple[str, str] | None = None,
+) -> tuple[str, int, int, int]:
+    images = image_list(image)
+    content: str | list = user_prompt
+    if images:
+        content = [
+            {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}}
+            for media_type, data in images
+        ]
+        content.append({"type": "text", "text": user_prompt})
     payload = _post(
         "https://api.anthropic.com/v1/messages",
         headers={"x-api-key": api_key, "anthropic-version": "2023-06-01"},
@@ -80,16 +124,29 @@ def _anthropic_text(api_key: str, model: str, system: str, user_prompt: str, tem
             "max_tokens": max_tokens,
             "temperature": temperature,
             "system": system + "\nReply with one JSON object only.",
-            "messages": [{"role": "user", "content": user_prompt}],
+            "messages": [{"role": "user", "content": content}],
         },
+        timeout=90 if images else 45,
     )
     usage = payload.get("usage") or {}
     text = payload["content"][0]["text"]
     return text, int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0), 0
 
 
-def _gemini_text(api_key: str, model: str, system: str, user_prompt: str, temperature: float, max_tokens: int) -> tuple[str, int, int, int]:
+def _gemini_text(
+    api_key: str,
+    model: str,
+    system: str,
+    user_prompt: str,
+    temperature: float,
+    max_tokens: int,
+    image: tuple[str, str] | None = None,
+) -> tuple[str, int, int, int]:
     name = model.removeprefix("models/")
+    images = image_list(image)
+    parts: list = [{"text": user_prompt}]
+    for media_type, data in images:
+        parts.append({"inline_data": {"mime_type": media_type, "data": data}})
     payload = _post(
         f"https://generativelanguage.googleapis.com/v1beta/models/{name}:generateContent",
         headers={},
@@ -101,8 +158,9 @@ def _gemini_text(api_key: str, model: str, system: str, user_prompt: str, temper
                 "maxOutputTokens": max_tokens,
                 "responseMimeType": "application/json",
             },
-            "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+            "contents": [{"role": "user", "parts": parts}],
         },
+        timeout=90 if images else 45,
     )
     usage = payload.get("usageMetadata") or {}
     text = payload["candidates"][0]["content"]["parts"][0]["text"]
@@ -133,7 +191,7 @@ def _as_score(value) -> int:
 
 def normalize_model_json(schema, data: dict) -> dict:
     """Accept the JSON shapes models commonly return for an evaluation."""
-    if schema.__name__ not in {"EvalAndNext", "EvalAndSummary"}:
+    if schema.__name__ not in {"EvalAndNext", "EvalAndSummary", "Evaluation"}:
         return data
     eval_keys = {
         "score",
@@ -167,6 +225,8 @@ def normalize_model_json(schema, data: dict) -> dict:
         data["next_question"] = {"question": nxt}
     elif isinstance(nxt, dict) and isinstance(nxt.get("rubric"), list):
         nxt["rubric"] = {"key_points": _as_str_list(nxt["rubric"])}
+    if schema.__name__ == "Evaluation":
+        return data.get("evaluation") if isinstance(data.get("evaluation"), dict) else data
     summary = data.get("summary")
     if isinstance(summary, dict):
         for key in ("strengths", "weak_subtopics", "misconceptions"):
@@ -175,13 +235,25 @@ def normalize_model_json(schema, data: dict) -> dict:
     return data
 
 
-def http_transport(*, credential, model: str, system: str, user_prompt: str, schema, temperature: float, max_tokens: int) -> LLMResult:
+def http_transport(
+    *,
+    credential,
+    model: str,
+    system: str,
+    user_prompt: str,
+    schema,
+    temperature: float,
+    max_tokens: int,
+    image: tuple[str, str] | None = None,
+) -> LLMResult:
     api_key = decrypt_secret(credential.api_key_enc)
     prompt = user_prompt
     last_error: Exception | None = None
     totals = [0, 0, 0]
     for _ in range(2):
-        text, prompt_tokens, completion_tokens, cached = _dispatch(credential, api_key, model, system, prompt, temperature, max_tokens)
+        text, prompt_tokens, completion_tokens, cached = _dispatch(
+            credential, api_key, model, system, prompt, temperature, max_tokens, image
+        )
         totals[0] += prompt_tokens
         totals[1] += completion_tokens
         totals[2] += cached
@@ -198,14 +270,23 @@ def http_transport(*, credential, model: str, system: str, user_prompt: str, sch
     raise ProviderError("The model reply could not be read") from last_error
 
 
-def _dispatch(credential, api_key: str, model: str, system: str, user_prompt: str, temperature: float, max_tokens: int):
+def _dispatch(
+    credential,
+    api_key: str,
+    model: str,
+    system: str,
+    user_prompt: str,
+    temperature: float,
+    max_tokens: int,
+    image: tuple[str, str] | None = None,
+):
     provider = credential.provider
     if provider == "openai":
-        return _openai_text("https://api.openai.com/v1", api_key, model, system, user_prompt, temperature, max_tokens)
+        return _openai_text("https://api.openai.com/v1", api_key, model, system, user_prompt, temperature, max_tokens, image)
     if provider == "openai_compatible":
-        return _openai_text(credential.base_url, api_key, model, system, user_prompt, temperature, max_tokens)
+        return _openai_text(credential.base_url, api_key, model, system, user_prompt, temperature, max_tokens, image)
     if provider == "anthropic":
-        return _anthropic_text(api_key, model, system, user_prompt, temperature, max_tokens)
+        return _anthropic_text(api_key, model, system, user_prompt, temperature, max_tokens, image)
     if provider == "gemini":
-        return _gemini_text(api_key, model, system, user_prompt, temperature, max_tokens)
+        return _gemini_text(api_key, model, system, user_prompt, temperature, max_tokens, image)
     raise ProviderError("Unsupported model provider")
