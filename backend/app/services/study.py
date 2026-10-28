@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -378,7 +379,7 @@ def _store_question(db, session, slot: PlannedSlot, generated: QuestionResult | 
         qtype=slot.qtype,
         is_retest=slot.is_retest,
         ucb_at_pick=slot.ucb,
-        question_text=generated.question.strip(),
+        question_text=_one_question(generated.question),
         rubric_json=generated.rubric.model_dump(),
         asked_at=datetime.now(timezone.utc),
     )
@@ -749,6 +750,49 @@ def _batch_prompt(db: Session, topic: Topic, slots: list[PlannedSlot]) -> str:
     return "\n".join(lines)
 
 
+_TASK_START = re.compile(
+    r"^(explain|derive|show|calculate|prove|compute|describe|compare|state|write|list|give|walk|discuss|outline)\b",
+    re.IGNORECASE,
+)
+_SECOND_TASK = re.compile(
+    r"\s+and\s+(?:also\s+)?(?:explain|derive|show|calculate|prove|compute|describe|compare)\b",
+    re.IGNORECASE,
+)
+
+
+def _one_question(text: str) -> str:
+    """Keep one question. A short related pair stays. A second assignment is removed."""
+    cleaned = " ".join(text.strip().split())
+    if not cleaned:
+        return cleaned
+    sentences = [part.strip() for part in re.findall(r".+?[.?!](?:\s+|$)|.+$", cleaned) if part.strip()]
+    kept: list[str] = []
+    asked = False
+    for sentence in sentences:
+        another_assignment = _TASK_START.match(sentence) is not None
+        if another_assignment and asked:
+            break
+        kept.append(sentence)
+        if another_assignment or sentence.endswith("?"):
+            asked = True
+    cleaned = " ".join(kept)
+    if kept and _TASK_START.match(kept[0]):
+        parts = _SECOND_TASK.split(cleaned, maxsplit=1)
+        if len(parts) > 1:
+            cleaned = parts[0].strip()
+            if cleaned and cleaned[-1] not in ".?!":
+                cleaned += "."
+    for marker in (" Also,", " Additionally,", " And also,", " And also "):
+        cut = cleaned.lower().find(marker.lower())
+        if cut > 0:
+            cleaned = cleaned[:cut].strip()
+    for marker in (" (b) ", " (2) ", " 2) ", " 2. "):
+        cut = cleaned.find(marker)
+        if cut > 0:
+            cleaned = cleaned[:cut].strip()
+    return cleaned.rstrip()
+
+
 def _image_list(image) -> list[tuple[str, str]]:
     if not image:
         return []
@@ -764,6 +808,7 @@ def _eval_prompt(topic, question: SessionQuestion, answer: str, digest: str, att
         f"Question: {question.question_text}",
         f"Hidden rubric key points: {rubric.get('key_points', [])}",
         f"Hidden common errors: {rubric.get('common_errors', [])}",
+        "Use the rubric only to score. In the correction, explain the right answer. Do not copy the rubric.",
         f"Earlier answers this session: {digest or 'none'}",
         f"<learner_answer>\n{answer}\n</learner_answer>",
     ]

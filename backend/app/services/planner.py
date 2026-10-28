@@ -102,15 +102,10 @@ def plan_session(
         used.add(subtopic.id)
 
     remaining = [item.subtopic for item in _rank(list(scored.values()), rng) if item.subtopic.id not in used]
-    cursor = 0
-    while len(slots) < question_count and remaining:
-        slots.append((remaining[cursor % len(remaining)], False))
-        cursor += 1
-        if cursor == len(remaining) and len(slots) < question_count:
-            # Every distinct subtopic is already placed; further slots repeat from the top.
-            pass
-        if cursor > question_count + len(remaining):
+    for subtopic in remaining:
+        if len(slots) >= question_count:
             break
+        slots.append((subtopic, False))
 
     planned: list[PlannedSlot] = []
     previous: str | None = None

@@ -89,6 +89,33 @@ def test_retest_is_reserved_before_ucb():
     assert plan[1].subtopic_id == 2
 
 
+def test_a_session_asks_each_subtopic_once():
+    subtopics = [
+        SubtopicView(i, f"s{i}", "core", "concept", ewma_score=None, attempts=0, open_misconceptions=0)
+        for i in range(1, 4)
+    ]
+    plan = plan_session(subtopics, question_count=5, rng=random.Random(1))
+    assert len(plan) == 3
+    assert len({slot.subtopic_id for slot in plan}) == 3
+
+
+def test_a_joined_question_keeps_the_first_ask():
+    from app.services.study import _one_question
+
+    assert _one_question("What is bias? How does it differ from variance?") == "What is bias? How does it differ from variance?"
+    naive = (
+        "Derive the formula for the posterior probability used in Naive Bayes classification starting from Bayes' theorem. "
+        "Explain each step and how the posterior is computed given the features and class labels."
+    )
+    assert _one_question(naive) == (
+        "Derive the formula for the posterior probability used in Naive Bayes classification starting from Bayes' theorem."
+    )
+    assert _one_question("Derive the posterior and explain each step.") == "Derive the posterior."
+    assert _one_question("Why does the posterior change? Also, give a number.") == "Why does the posterior change?"
+    assert _one_question("Explain bias (a) in words (b) with a formula.") == "Explain bias (a) in words"
+    assert _one_question("Why is bias also different from variance?") == "Why is bias also different from variance?"
+
+
 def test_session_score_is_percent_of_five_point_rubric():
     assert session_percent([5, 5, 5, 5, 0]) == 80
     assert session_percent([4, 4, 4, 4, 4]) == 80
